@@ -1,5 +1,6 @@
 #include "speech_core/pipeline/voice_pipeline.h"
 #include "speech_core/audio/pcm_codec.h"
+#include "speech_core/audio/resampler.h"
 
 #include <chrono>
 #include <stdexcept>
@@ -508,8 +509,20 @@ void VoicePipeline::speak(const std::string& text, const std::string& language,
 
                 if (emit_length > 0) {
                     // Feed TTS audio as far-end reference for echo cancellation
+                    // Resample to AEC sample rate if needed
                     if (echo_canceller_) {
-                        echo_canceller_->feed_reference(samples, emit_length);
+                        int tts_rate = tts_.output_sample_rate();
+                        int aec_rate = echo_canceller_->input_sample_rate();
+
+                        if (tts_rate != aec_rate) {
+                            // Resample TTS output to AEC sample rate
+                            auto resampled = Resampler::resample(
+                                samples, emit_length, tts_rate, aec_rate);
+                            echo_canceller_->feed_reference(
+                                resampled.data(), resampled.size());
+                        } else {
+                            echo_canceller_->feed_reference(samples, emit_length);
+                        }
                     }
 
                     auto pcm = PCMCodec::float_to_pcm16(samples, emit_length);
