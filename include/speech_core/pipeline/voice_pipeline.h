@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -141,6 +142,7 @@ private:
     std::vector<PendingUtterance> pending_utterances_;
     std::atomic<bool> worker_busy_{false};
     std::atomic<bool> eager_invalidated_{false};  // set when SpeechResumed discards an eager utterance
+    std::atomic<bool> is_synthesizing_{false};    // ensures only one synthesis thread at a time
 
     void worker_loop();
     void on_turn_event(const TurnEvent& event);
@@ -148,6 +150,8 @@ private:
                            float stt_duration_ms = 0.0f);
     void speak(const std::string& text, const std::string& language = "",
                float stt_duration_ms = 0.0f, float llm_duration_ms = 0.0f);
+    void process_speech_queue(const std::string& language,
+                              float stt_duration_ms, float llm_duration_ms);
     void emit_error(const std::string& message);
     std::string call_llm_with_tools();
 };

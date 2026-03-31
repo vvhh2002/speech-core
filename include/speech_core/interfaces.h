@@ -144,6 +144,13 @@ public:
         const std::vector<Message>& messages,
         LLMTokenCallback on_token) = 0;
 
+    /// Async version of chat.
+    /// @param on_done Called when response is complete
+    virtual void chat_async(
+        const std::vector<Message>& messages,
+        LLMTokenCallback on_token,
+        std::function<void(LLMResponse)> on_done) = 0;
+
     /// Provide tool definitions to the LLM.
     /// Called once when tools are registered. Default: no-op.
     virtual void set_tools(const std::vector<ToolDefinition>& /*tools*/) {}

@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace speech_core;
@@ -143,6 +144,17 @@ public:
             &on_token);
 
         return {};  // C API doesn't support tool calls yet
+    }
+
+    void chat_async(const std::vector<Message>& messages,
+                    LLMTokenCallback on_token,
+                    std::function<void(LLMResponse)> on_done) override
+    {
+        // C API doesn't have native async, use sync chat in a detached thread
+        std::thread([this, messages, on_token, on_done]() {
+            auto response = chat(messages, on_token);
+            if (on_done) on_done(response);
+        }).detach();
     }
 
     void cancel() override {

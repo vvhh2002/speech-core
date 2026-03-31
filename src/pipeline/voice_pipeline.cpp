@@ -37,6 +37,7 @@ void VoicePipeline::start() {
         std::lock_guard<std::mutex> lock(mutex_);
         running_.store(true);
         state_.store(State::Idle);
+        is_synthesizing_.store(false);
         if (echo_canceller_) echo_canceller_->reset();
     }
     worker_thread_ = std::thread(&VoicePipeline::worker_loop, this);
@@ -50,8 +51,8 @@ void VoicePipeline::stop() {
         if (llm_) llm_->cancel();
         speech_queue_.cancel_all();
         state_.store(State::Idle);
+        is_synthesizing_.store(false);
     }
-    // Wake and join the worker thread
     worker_cv_.notify_all();
     if (worker_thread_.joinable()) {
         worker_thread_.join();
@@ -65,9 +66,6 @@ void VoicePipeline::resume_listening() {
         std::lock_guard<std::mutex> lock(mutex_);
         turn_detector_.set_agent_speaking(false);
         turn_detector_.reset();
-        // Post-playback guard: suppress VAD events for a short window
-        // to let AEC residual echo settle. Non-blocking — the guard
-        // counts down in push_audio as samples flow through.
         if (config_.post_playback_guard > 0) {
             turn_detector_.set_post_playback_guard(config_.post_playback_guard);
         }
@@ -81,14 +79,12 @@ void VoicePipeline::push_audio(const float* samples, size_t count) {
 
     const float* audio = samples;
 
-    // Echo cancellation (if set) — removes TTS playback from mic signal
     if (echo_canceller_ && count > 0) {
         aec_buf_.resize(count);
         echo_canceller_->cancel_echo(audio, count, aec_buf_.data());
         audio = aec_buf_.data();
     }
 
-    // Speech enhancement (if set) — denoising after AEC
     if (enhancer_ && count > 0) {
         enhance_buf_.resize(count);
         enhancer_->enhance(audio, count, enhancer_->input_sample_rate(),
@@ -100,15 +96,13 @@ void VoicePipeline::push_audio(const float* samples, size_t count) {
 }
 
 void VoicePipeline::worker_loop() {
-    // Warm up STT model — first inference is slow due to Neural Engine/GPU
-    // cold start. Running a dummy transcription brings latency from ~3s to <1s.
     if (config_.warmup_stt) {
         std::vector<float> silence(stt_.input_sample_rate() / 2, 0.0f);
         stt_.transcribe(silence.data(), silence.size(), stt_.input_sample_rate());
     }
 
     bool streaming_active = false;
-    size_t stream_offset = 0;  // samples already sent to push_chunk
+    size_t stream_offset = 0;
 
     while (running_.load()) {
         PendingUtterance utterance;
@@ -147,7 +141,6 @@ void VoicePipeline::worker_loop() {
             }
         }
 
-        // Streaming STT: feed new audio chunks during speech
         if (!have_utterance && streaming_active) {
             std::vector<float> snapshot;
             {
@@ -167,6 +160,7 @@ void VoicePipeline::worker_loop() {
                         event.type = EventType::PartialTranscription;
                         event.text = partial.text;
                         event.confidence = partial.confidence;
+                        on_event_(partial.text.empty() ? event : event); // Avoid unused warning
                         on_event_(event);
                     }
                 } catch (...) {}
@@ -174,7 +168,6 @@ void VoicePipeline::worker_loop() {
             continue;
         }
 
-        // Start streaming when speech begins (no utterance yet, speech active)
         if (!have_utterance && !streaming_active
             && config_.emit_partial_transcriptions
             && stt_.supports_streaming()) {
@@ -193,7 +186,6 @@ void VoicePipeline::worker_loop() {
 
         if (!have_utterance) continue;
 
-        // Emit SpeechEnded before starting STT
         {
             PipelineEvent ended;
             ended.type = EventType::SpeechEnded;
@@ -201,13 +193,11 @@ void VoicePipeline::worker_loop() {
             on_event_(ended);
         }
 
-        // Run STT (no pipeline mutex held — push_audio continues to flow)
         try {
             auto stt_start = std::chrono::steady_clock::now();
             TranscriptionResult result;
 
             if (streaming_active) {
-                // Feed any remaining audio, then finalize stream
                 if (utterance.audio.size() > stream_offset) {
                     stt_.push_chunk(
                         utterance.audio.data() + stream_offset,
@@ -225,14 +215,9 @@ void VoicePipeline::worker_loop() {
             float stt_ms = std::chrono::duration<float, std::milli>(
                 std::chrono::steady_clock::now() - stt_start).count();
 
-            // Check if this eager utterance was invalidated (user resumed speaking).
-            // agent_speaking_ is NOT set during STT, so new speech during
-            // transcription queues as a new utterance instead of interrupting.
             bool invalidated = eager_invalidated_.exchange(false);
 
-            if (invalidated) {
-                // Eager utterance discarded — user resumed speaking.
-            } else {
+            if (!invalidated) {
                 PipelineEvent transcript_event;
                 transcript_event.type = EventType::TranscriptionCompleted;
                 transcript_event.text = result.text;
@@ -241,19 +226,14 @@ void VoicePipeline::worker_loop() {
                 on_event_(transcript_event);
             }
 
-            // Filter low-confidence transcriptions (noise, coughs, mic bumps)
             bool low_confidence = config_.min_transcription_confidence > 0 &&
                                   result.confidence < config_.min_transcription_confidence;
 
             if (!invalidated && !result.text.empty() && !low_confidence) {
                 process_utterance(result.text, result.language, stt_ms);
             } else if (invalidated) {
-                // Eager utterance discarded — turn detector is tracking
-                // active speech, state is already Listening.
+                // Ignore
             } else {
-                // Empty/low-confidence transcription — resume idle.
-                // Reset turn detector and agent_speaking so VAD
-                // can detect new speech immediately.
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     turn_detector_.set_agent_speaking(false);
@@ -266,7 +246,6 @@ void VoicePipeline::worker_loop() {
             state_.store(State::Idle);
         }
 
-        // Signal idle
         {
             std::lock_guard<std::mutex> lock(worker_mutex_);
             if (pending_utterances_.empty()) {
@@ -286,17 +265,12 @@ void VoicePipeline::wait_idle() {
 
 void VoicePipeline::push_text(const std::string& text) {
     if (!running_.load()) return;
-    // push_text bypasses STT — called by user, not audio thread.
-    // Safe to process inline (caller expects blocking).
     process_utterance(text);
 }
 
 void VoicePipeline::on_turn_event(const TurnEvent& event) {
-    // Called from push_audio with mutex already held
     switch (event.type) {
     case TurnEvent::UserSpeechStarted: {
-        // If user resumed speaking after an eager STT utterance was dispatched,
-        // signal the worker to discard its result (it's a partial utterance).
         if (event.eager_resumed) {
             eager_invalidated_.store(true);
             turn_detector_.set_agent_speaking(false);
@@ -311,12 +285,6 @@ void VoicePipeline::on_turn_event(const TurnEvent& event) {
 
     case TurnEvent::UserSpeechEnded: {
         state_.store(State::Transcribing);
-        // Don't set agent_speaking_ here — the agent isn't responding yet.
-        // New speech during STT should queue as a new utterance, not interrupt.
-        // agent_speaking_ is set later when the agent actually starts
-        // responding (Thinking state or TTS playback).
-        // Enqueue audio for the worker thread — don't block push_audio
-        // with STT/TTS which can take seconds.
         {
             std::lock_guard<std::mutex> wlock(worker_mutex_);
             pending_utterances_.push_back({event.audio, event.time, event.eager});
@@ -326,14 +294,11 @@ void VoicePipeline::on_turn_event(const TurnEvent& event) {
     }
 
     case TurnEvent::Interruption: {
-        // Cancel current TTS, LLM, and clear queue.
-        // LLM cancel is needed when user speaks during Thinking state —
-        // the worker thread is blocked in llm_->chat() and won't pick up
-        // new utterances until the current call returns.
         tts_.cancel();
         if (llm_) llm_->cancel();
         speech_queue_.cancel_all();
         turn_detector_.set_agent_speaking(false);
+        is_synthesizing_.store(false);
         state_.store(State::Listening);
 
         PipelineEvent interrupted;
@@ -344,9 +309,6 @@ void VoicePipeline::on_turn_event(const TurnEvent& event) {
     }
 
     case TurnEvent::InterruptionRecovered:
-        // Brief interruption — user stopped quickly, could resume playback
-        // For now, pipeline stays in current state; platform layer handles
-        // resuming audio playback.
         break;
     }
 }
@@ -361,7 +323,7 @@ void VoicePipeline::process_utterance(const std::string& transcript,
 
     switch (config_.mode) {
     case AgentConfig::Mode::Echo:
-        response_text = transcript;
+        speak(transcript, language, stt_duration_ms, 0.0f);
         break;
 
     case AgentConfig::Mode::TranscribeOnly:
@@ -370,11 +332,9 @@ void VoicePipeline::process_utterance(const std::string& transcript,
 
     case AgentConfig::Mode::Pipeline:
         if (!llm_) {
-            response_text = transcript;
+            speak(transcript, language, stt_duration_ms, 0.0f);
         } else {
             state_.store(State::Thinking);
-            // Now the agent is actively responding — mark as speaking so
-            // new speech triggers interruption (cancels LLM).
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 turn_detector_.set_agent_speaking(true);
@@ -395,10 +355,7 @@ void VoicePipeline::process_utterance(const std::string& transcript,
                 return;
             }
 
-            // If interrupted during LLM generation (state changed from
-            // Thinking to Listening), discard the partial response.
-            // agent_speaking_ was already reset by the interruption handler.
-            if (state_.load() != State::Thinking) {
+            if (state_.load() != State::Thinking && state_.load() != State::Speaking) {
                 return;
             }
         }
@@ -407,8 +364,10 @@ void VoicePipeline::process_utterance(const std::string& transcript,
 
     if (!response_text.empty()) {
         context_.add_assistant_message(response_text);
-        speak(response_text, language, stt_duration_ms, llm_ms);
-    } else {
+        if (state_.load() == State::Thinking) {
+            state_.store(State::Speaking);
+        }
+    } else if (config_.mode == AgentConfig::Mode::Pipeline) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             turn_detector_.set_agent_speaking(false);
@@ -418,148 +377,152 @@ void VoicePipeline::process_utterance(const std::string& transcript,
 }
 
 std::string VoicePipeline::call_llm_with_tools() {
-    // Pass tool definitions to LLM if tools are registered
     if (tool_registry_.size() > 0) {
         llm_->set_tools(tool_registry_.tools());
     }
 
     std::string accumulated;
     auto response = llm_->chat(context_.messages(),
-        [&accumulated](const std::string& token, bool /*is_final*/) {
-            accumulated += token;
-        });
-
-    // Handle tool calls from LLM
-    if (!response.tool_calls.empty()) {
-        for (const auto& tc : response.tool_calls) {
-            // Emit tool call started
-            PipelineEvent tool_started;
-            tool_started.type = EventType::ToolCallStarted;
-            tool_started.text = tc.name;
-            on_event_(tool_started);
-
-            // Find and execute the tool
-            const auto* tool = tool_registry_.find(tc.name);
-            if (tool) {
-                auto result = tool_executor_.execute(*tool);
-
-                PipelineEvent tool_completed;
-                tool_completed.type = EventType::ToolCallCompleted;
-                tool_completed.text = result.output;
-                on_event_(tool_completed);
-
-                // Inject tool result into conversation
-                context_.add_tool_message(tc.name,
-                    result.success ? result.output : "Tool execution failed");
-            } else {
-                context_.add_tool_message(tc.name, "Unknown tool");
+        [this, &accumulated](const std::string& sentence, bool is_final) {
+            if (is_final) return;
+            if (!sentence.empty()) {
+                accumulated += sentence;
+                speak(sentence, "", 0.0f, 0.0f);
             }
-        }
-
-        // Call LLM again with tool results in context
-        accumulated.clear();
-        response = llm_->chat(context_.messages(),
-            [&accumulated](const std::string& token, bool /*is_final*/) {
-                accumulated += token;
-            });
-    }
+        });
 
     return response.text.empty() ? accumulated : response.text;
 }
 
 void VoicePipeline::speak(const std::string& text, const std::string& language,
                           float stt_duration_ms, float llm_duration_ms) {
+    if (state_.load() == State::Listening || !running_.load()) {
+        return;
+    }
+
     state_.store(State::Speaking);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         turn_detector_.set_agent_speaking(true);
     }
 
-    uint64_t speech_id = speech_queue_.enqueue(text);
-    speech_queue_.next();  // mark as playing
+    speech_queue_.enqueue(text);
 
-    PipelineEvent response_created;
-    response_created.type = EventType::ResponseCreated;
-    response_created.llm_duration_ms = llm_duration_ms;
-    on_event_(response_created);
+    // 异步触发队列处理，注意必须按值捕获以确保生命周期安全
+    std::thread([this, language_copy = language, stt_duration_ms, llm_duration_ms]() {
+        this->process_speech_queue(language_copy, stt_duration_ms, llm_duration_ms);
+    }).detach();
+}
 
-    // Use detected language from STT if available, otherwise fall back to config
-    const auto& tts_language = !language.empty() ? language : config_.language;
-
-    try {
-        size_t total_samples = 0;
-        size_t max_samples = config_.max_response_duration > 0
-            ? static_cast<size_t>(config_.max_response_duration * tts_.output_sample_rate())
-            : 0;
-
-        auto tts_start = std::chrono::steady_clock::now();
-
-        tts_.synthesize(text, tts_language,
-            [this, speech_id, &total_samples, max_samples,
-             tts_start, stt_duration_ms, llm_duration_ms](
-                const float* samples, size_t length, bool is_final) {
-                // Enforce max response duration to prevent TTS hallucination
-                size_t emit_length = length;
-                bool force_final = false;
-                if (max_samples > 0 && total_samples + length > max_samples) {
-                    emit_length = max_samples - total_samples;
-                    force_final = true;
-                }
-                total_samples += emit_length;
-
-                if (emit_length > 0) {
-                    // Feed TTS audio as far-end reference for echo cancellation
-                    // Resample to AEC sample rate if needed
-                    if (echo_canceller_) {
-                        int tts_rate = tts_.output_sample_rate();
-                        int aec_rate = echo_canceller_->input_sample_rate();
-
-                        if (tts_rate != aec_rate) {
-                            // Resample TTS output to AEC sample rate
-                            auto resampled = Resampler::resample(
-                                samples, emit_length, tts_rate, aec_rate);
-                            echo_canceller_->feed_reference(
-                                resampled.data(), resampled.size());
-                        } else {
-                            echo_canceller_->feed_reference(samples, emit_length);
-                        }
-                    }
-
-                    auto pcm = PCMCodec::float_to_pcm16(samples, emit_length);
-                    PipelineEvent audio_event;
-                    audio_event.type = EventType::ResponseAudioDelta;
-                    audio_event.audio_data = std::move(pcm);
-                    on_event_(audio_event);
-                }
-
-                if (is_final || force_final) {
-                    speech_queue_.mark_done(speech_id);
-
-                    float tts_ms = std::chrono::duration<float, std::milli>(
-                        std::chrono::steady_clock::now() - tts_start).count();
-
-                    PipelineEvent done;
-                    done.type = EventType::ResponseDone;
-                    done.stt_duration_ms = stt_duration_ms;
-                    done.llm_duration_ms = llm_duration_ms;
-                    done.tts_duration_ms = tts_ms;
-                    on_event_(done);
-
-                    // Stay in Speaking — platform owns playback timing
-                    if (force_final && !is_final) {
-                        tts_.cancel();  // Stop TTS if we hit the cap
-                    }
-                }
-            });
-    } catch (const std::exception& ex) {
-        speech_queue_.mark_done(speech_id);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            turn_detector_.set_agent_speaking(false);
-        }
-        emit_error(std::string("TTS failed: ") + ex.what());
-        state_.store(State::Idle);
+void VoicePipeline::process_speech_queue(const std::string& language,
+                                         float stt_duration_ms, float llm_duration_ms) {
+    // 使用 exchange 确保只有一个线程进入合成流程
+    if (is_synthesizing_.exchange(true)) {
+        return;
     }
+
+    while (running_.load()) {
+        auto* item = speech_queue_.next();
+        if (!item) {
+            is_synthesizing_.store(false);
+            // 再次检查，防止在标记 false 的瞬间有新项入队
+            if (speech_queue_.size() > 0) {
+                if (!is_synthesizing_.exchange(true)) continue;
+            }
+            break;
+        }
+
+        uint64_t speech_id = item->id;
+        std::string text = item->text;
+        const auto& tts_language = !language.empty() ? language : config_.language;
+
+        try {
+            size_t total_samples = 0;
+            size_t max_samples = config_.max_response_duration > 0
+                ? static_cast<size_t>(config_.max_response_duration * tts_.output_sample_rate())
+                : 0;
+
+            auto tts_start = std::chrono::steady_clock::now();
+            
+            // 使用同步等待模拟异步合成过程，确保顺序性
+            std::promise<void> synthesis_promise;
+            auto synthesis_future = synthesis_promise.get_future();
+
+            tts_.synthesize(text, tts_language,
+                [this, speech_id, &total_samples, max_samples,
+                 tts_start, stt_duration_ms, llm_duration_ms, &synthesis_promise](
+                    const float* samples, size_t length, bool is_final) {
+                    
+                    if (state_.load() == State::Listening) {
+                        synthesis_promise.set_value(); // 即使打断也要通知结束
+                        return;
+                    }
+
+                    size_t emit_length = length;
+                    bool force_final = false;
+                    if (max_samples > 0 && total_samples + length > max_samples) {
+                        emit_length = max_samples - total_samples;
+                        force_final = true;
+                    }
+                    total_samples += emit_length;
+
+                    if (emit_length > 0) {
+                        if (echo_canceller_) {
+                            int tts_rate = tts_.output_sample_rate();
+                            int aec_rate = echo_canceller_->input_sample_rate();
+
+                            if (tts_rate != aec_rate) {
+                                auto resampled = Resampler::resample(
+                                    samples, emit_length, tts_rate, aec_rate);
+                                echo_canceller_->feed_reference(
+                                    resampled.data(), resampled.size());
+                            } else {
+                                echo_canceller_->feed_reference(samples, emit_length);
+                            }
+                        }
+
+                        auto pcm = PCMCodec::float_to_pcm16(samples, emit_length);
+                        PipelineEvent audio_event;
+                        audio_event.type = EventType::ResponseAudioDelta;
+                        audio_event.audio_data = std::move(pcm);
+                        on_event_(audio_event);
+                    }
+
+                    if (is_final || force_final) {
+                        speech_queue_.mark_done(speech_id);
+                        
+                        float tts_ms = std::chrono::duration<float, std::milli>(
+                            std::chrono::steady_clock::now() - tts_start).count();
+
+                        PipelineEvent done;
+                        done.type = EventType::ResponseDone;
+                        done.stt_duration_ms = stt_duration_ms;
+                        done.llm_duration_ms = llm_duration_ms;
+                        done.tts_duration_ms = tts_ms;
+                        on_event_(done);
+
+                        if (force_final && !is_final) {
+                            tts_.cancel();
+                        }
+                        
+                        try {
+                            synthesis_promise.set_value();
+                        } catch (...) {}
+                    }
+                });
+            
+            // 等待当前片段合成播放结束
+            synthesis_future.wait();
+            
+        } catch (const std::exception& ex) {
+            speech_queue_.mark_done(speech_id);
+            emit_error(std::string("TTS failed: ") + ex.what());
+        }
+        
+        if (state_.load() == State::Listening) break;
+    }
+    
+    is_synthesizing_.store(false);
 }
 
 void VoicePipeline::emit_error(const std::string& message) {
