@@ -299,6 +299,13 @@ void VoicePipeline::on_turn_event(const TurnEvent& event) {
         speech_queue_.cancel_all();
         turn_detector_.set_agent_speaking(false);
         is_synthesizing_.store(false);
+
+        // 只有在 Speaking 状态才移除 assistant 消息
+        // Thinking 状态表示 LLM 还在生成，assistant 消息还未保存
+        if (state_.load() == State::Speaking) {
+            context_.remove_last_assistant_message();
+        }
+
         state_.store(State::Listening);
 
         PipelineEvent interrupted;
@@ -319,7 +326,6 @@ void VoicePipeline::process_utterance(const std::string& transcript,
     context_.add_user_message(transcript);
 
     std::string response_text;
-    float llm_ms = 0.0f;
 
     switch (config_.mode) {
     case AgentConfig::Mode::Echo:

@@ -43,6 +43,10 @@ public:
     /// Number of messages (excluding system prompt).
     size_t turn_count() const;
 
+    /// Remove the last assistant message (used when response is interrupted).
+    /// Returns true if a message was removed, false if no assistant message found.
+    bool remove_last_assistant_message();
+
     /// Clear all messages except system prompt.
     void clear();
 

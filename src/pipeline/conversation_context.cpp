@@ -89,6 +89,18 @@ size_t ConversationContext::turn_count() const {
     return count;
 }
 
+bool ConversationContext::remove_last_assistant_message() {
+    // 从后向前查找最后一条 assistant 消息
+    for (auto it = messages_.rbegin(); it != messages_.rend(); ++it) {
+        if (it->role == MessageRole::Assistant) {
+            // 转换为正向迭代器进行删除
+            messages_.erase(std::next(it).base());
+            return true;
+        }
+    }
+    return false;
+}
+
 void ConversationContext::clear() {
     if (!messages_.empty() && messages_[0].role == MessageRole::System) {
         messages_.resize(1);
