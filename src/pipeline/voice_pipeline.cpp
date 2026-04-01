@@ -326,6 +326,7 @@ void VoicePipeline::process_utterance(const std::string& transcript,
     context_.add_user_message(transcript);
 
     std::string response_text;
+    // float llm_ms = 0.0f;
 
     switch (config_.mode) {
     case AgentConfig::Mode::Echo:
@@ -349,8 +350,8 @@ void VoicePipeline::process_utterance(const std::string& transcript,
             try {
                 auto llm_start = std::chrono::steady_clock::now();
                 response_text = call_llm_with_tools();
-                llm_ms = std::chrono::duration<float, std::milli>(
-                    std::chrono::steady_clock::now() - llm_start).count();
+                // llm_ms = std::chrono::duration<float, std::milli>(
+                //     std::chrono::steady_clock::now() - llm_start).count();
             } catch (const std::exception& ex) {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
